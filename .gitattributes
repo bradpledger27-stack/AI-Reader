@@ -10,3 +10,4 @@
 # Binary files should be left untouched
 *.jar           binary
 
+app/src/main/assets/tts/tokens.txt text eol=lf
