@@ -1,11 +1,11 @@
 package com.aireader.app
 
 import android.os.Bundle
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import android.speech.tts.Voice
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,8 +13,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -22,43 +20,67 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import java.util.Locale
+import java.io.File
 
-class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var textToSpeech: TextToSpeech
     private lateinit var aiVoicePlayer: AiVoicePlayer
-    private var ttsReady = false
-
-    private var chunks: List<String> = emptyList()
-    private var currentChunk = 0
-    private var paused = false
 
     private var speechRate = 1.0f
-    private var speechPitch = 1.0f
+    private var currentReaderText = ""
 
-    private var availableVoices by mutableStateOf<List<Voice>>(emptyList())
-    private var selectedVoiceName by mutableStateOf<String?>(null)
+    private var playbackStatus by
+    mutableStateOf("Ready")
 
     private val prefs by lazy {
-        getSharedPreferences("ai_reader", MODE_PRIVATE)
+        getSharedPreferences(
+            "ai_reader",
+            MODE_PRIVATE
+        )
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        aiVoicePlayer = AiVoicePlayer(this)
-        speechRate = prefs.getFloat("speech_rate", 1.0f)
-        speechPitch = prefs.getFloat("speech_pitch", 1.0f)
-        selectedVoiceName = prefs.getString("voice_name", null)
+    private val savedTextFile by lazy {
+        File(filesDir, "saved_reader_text.txt")
+    }
 
-        textToSpeech = TextToSpeech(this, this)
+    override fun onCreate(
+        savedInstanceState: Bundle?
+    ) {
+        super.onCreate(savedInstanceState)
+
+        speechRate =
+            prefs.getFloat(
+                "speech_rate",
+                1.0f
+            )
+
+        currentReaderText =
+            try {
+                if (savedTextFile.exists()) {
+                    savedTextFile.readText()
+                } else {
+                    ""
+                }
+            } catch (_: Throwable) {
+                ""
+            }
+
+        aiVoicePlayer =
+            AiVoicePlayer(
+                context = this,
+                onStatusChanged = { status ->
+                    playbackStatus = status
+                }
+            )
 
         setContent {
             MaterialTheme {
@@ -66,56 +88,49 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     modifier = Modifier.fillMaxSize()
                 ) {
                     AIReaderScreen(
-                        initialSpeed = speechRate,
-                        initialPitch = speechPitch,
-                        voices = availableVoices,
-                        selectedVoiceName = selectedVoiceName,
+                        initialText =
+                            currentReaderText,
+                        initialSpeed =
+                            speechRate,
+                        playbackStatus =
+                            playbackStatus,
 
-                        onVoiceSelected = { voice ->
-                            selectVoice(voice)
-                        },
-
-                        onTestAiVoice = {
-                        aiVoicePlayer.speakTestSentence()
+                        onTextChanged = { text ->
+                            currentReaderText = text
                         },
 
                         onPlay = { text ->
-                            startReading(text)
+                            aiVoicePlayer.speak(
+                                text = text,
+                                speed = speechRate
+                            )
                         },
 
                         onPause = {
-                            pauseReading()
+                            aiVoicePlayer.pause()
                         },
 
                         onResume = {
-                            resumeReading()
+                            aiVoicePlayer.resume()
                         },
 
                         onStop = {
-                            stopReading()
+                            aiVoicePlayer.stop()
+                        },
+
+                        onTestAiVoice = {
+                            aiVoicePlayer
+                                .speakTestSentence()
                         },
 
                         onSpeedChanged = { speed ->
                             speechRate = speed
 
-                            if (ttsReady) {
-                                textToSpeech.setSpeechRate(speed)
-                            }
-
                             prefs.edit()
-                                .putFloat("speech_rate", speed)
-                                .apply()
-                        },
-
-                        onPitchChanged = { pitch ->
-                            speechPitch = pitch
-
-                            if (ttsReady) {
-                                textToSpeech.setPitch(pitch)
-                            }
-
-                            prefs.edit()
-                                .putFloat("speech_pitch", pitch)
+                                .putFloat(
+                                    "speech_rate",
+                                    speed
+                                )
                                 .apply()
                         }
                     )
@@ -124,285 +139,44 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    override fun onInit(status: Int) {
-
-        if (status != TextToSpeech.SUCCESS) {
-            return
-        }
-
-        val languageResult =
-            textToSpeech.setLanguage(Locale.getDefault())
-
-        ttsReady =
-            languageResult != TextToSpeech.LANG_MISSING_DATA &&
-            languageResult != TextToSpeech.LANG_NOT_SUPPORTED
-
-        if (!ttsReady) {
-            return
-        }
-
-        textToSpeech.setSpeechRate(speechRate)
-        textToSpeech.setPitch(speechPitch)
-
-        availableVoices =
-            textToSpeech.voices
-                ?.filter { voice ->
-                    voice.locale.language.equals(
-                        "en",
-                        ignoreCase = true
-                    )
-                }
-                ?.sortedWith(
-                    compareBy<Voice>(
-                        { voicePriority(it) },
-                        { it.locale.displayCountry },
-                        { it.name }
-                    )
-                )
-                ?: emptyList()
-
-        restoreVoice()
-
-        textToSpeech.setOnUtteranceProgressListener(
-            object : UtteranceProgressListener() {
-
-                override fun onStart(utteranceId: String?) {
-                }
-
-                override fun onDone(utteranceId: String?) {
-
-                    if (!paused) {
-
-                        currentChunk++
-
-                        if (currentChunk < chunks.size) {
-                            speakCurrentChunk()
-                        }
-                    }
-                }
-
-                override fun onError(utteranceId: String?) {
-                }
-            }
-        )
-    }
-
-    private fun voicePriority(voice: Voice): Int {
-
-        val country =
-            voice.locale.country.uppercase(Locale.ROOT)
-
-        return when (country) {
-            "NZ" -> 0
-            "AU" -> 1
-            "GB" -> 2
-            "US" -> 3
-            else -> 4
-        }
-    }
-
-    private fun restoreVoice() {
-
-        val savedName = selectedVoiceName
-
-        val savedVoice =
-            availableVoices.firstOrNull {
-                it.name == savedName
-            }
-
-        if (savedVoice != null) {
-            textToSpeech.voice = savedVoice
-            selectedVoiceName = savedVoice.name
-            return
-        }
-
-        val nzVoice =
-            availableVoices.firstOrNull {
-                it.locale.country.equals(
-                    "NZ",
-                    ignoreCase = true
-                )
-            }
-
-        val defaultVoice =
-            nzVoice ?: availableVoices.firstOrNull()
-
-        if (defaultVoice != null) {
-            selectVoice(defaultVoice)
-        }
-    }
-
-    private fun selectVoice(voice: Voice) {
-
-        if (!ttsReady) {
-            return
-        }
-
-        val result = textToSpeech.setVoice(voice)
-
-        if (result == TextToSpeech.SUCCESS) {
-
-            selectedVoiceName = voice.name
-
-            prefs.edit()
-                .putString("voice_name", voice.name)
-                .apply()
-        }
-    }
-
-    private fun startReading(text: String) {
-
-        if (!ttsReady || text.isBlank()) {
-            return
-        }
-
-        textToSpeech.stop()
-
-        chunks = splitText(text)
-        currentChunk = 0
-        paused = false
-
-        speakCurrentChunk()
-    }
-
-    private fun pauseReading() {
-
-        if (!ttsReady || chunks.isEmpty()) {
-            return
-        }
-
-        paused = true
-        textToSpeech.stop()
-    }
-
-    private fun resumeReading() {
-
-        if (!ttsReady || chunks.isEmpty()) {
-            return
-        }
-
-        paused = false
-        speakCurrentChunk()
-    }
-
-    private fun stopReading() {
-
-        paused = false
-        currentChunk = 0
-        chunks = emptyList()
-
-        if (::textToSpeech.isInitialized) {
-            textToSpeech.stop()
-        }
-    }
-
-    private fun speakCurrentChunk() {
-
-        if (
-            !ttsReady ||
-            paused ||
-            currentChunk !in chunks.indices
-        ) {
-            return
-        }
-
-        textToSpeech.setSpeechRate(speechRate)
-        textToSpeech.setPitch(speechPitch)
-
-        textToSpeech.speak(
-            chunks[currentChunk],
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            "AI_READER_$currentChunk"
-        )
-    }
-
-    private fun splitText(text: String): List<String> {
-
-        val maximumLength = 3000
-
-        if (text.length <= maximumLength) {
-            return listOf(text)
-        }
-
-        val result = mutableListOf<String>()
-        var remaining = text.trim()
-
-        while (remaining.isNotEmpty()) {
-
-            if (remaining.length <= maximumLength) {
-                result.add(remaining)
-                break
-            }
-
-            var splitPosition =
-                remaining.lastIndexOf(
-                    '.',
-                    maximumLength
-                )
-
-            if (splitPosition < maximumLength / 2) {
-                splitPosition =
-                    remaining.lastIndexOf(
-                        ' ',
-                        maximumLength
-                    )
-            }
-
-            if (splitPosition <= 0) {
-                splitPosition = maximumLength
-            } else {
-                splitPosition++
-            }
-
-            result.add(
-                remaining.substring(
-                    0,
-                    splitPosition
-                ).trim()
+    override fun onStop() {
+        try {
+            savedTextFile.writeText(
+                currentReaderText
             )
-
-            remaining =
-                remaining.substring(splitPosition)
-                    .trim()
+        } catch (_: Throwable) {
+            // Keep the app running if saving fails.
         }
 
-        return result
+        super.onStop()
     }
 
     override fun onDestroy() {
-
-        if (::textToSpeech.isInitialized) {
-            textToSpeech.stop()
-            textToSpeech.shutdown()
-        }
-
         if (::aiVoicePlayer.isInitialized) {
-        aiVoicePlayer.release()
-    }
+            aiVoicePlayer.release()
+        }
 
         super.onDestroy()
     }
-    }
+}
 
 @Composable
 fun AIReaderScreen(
+    initialText: String,
     initialSpeed: Float,
-    initialPitch: Float,
-    voices: List<Voice>,
-    selectedVoiceName: String?,
-    onVoiceSelected: (Voice) -> Unit,
-    onTestAiVoice: () -> Unit,
+    playbackStatus: String,
+    onTextChanged: (String) -> Unit,
     onPlay: (String) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onStop: () -> Unit,
-    onSpeedChanged: (Float) -> Unit,
-    onPitchChanged: (Float) -> Unit
+    onTestAiVoice: () -> Unit,
+    onSpeedChanged: (Float) -> Unit
 ) {
+    val context = LocalContext.current
 
     var text by remember {
-        mutableStateOf("")
+        mutableStateOf(initialText)
     }
 
     var playerState by remember {
@@ -413,18 +187,59 @@ fun AIReaderScreen(
         mutableStateOf(initialSpeed)
     }
 
-    var pitch by remember {
-        mutableStateOf(initialPitch)
-    }
+    val filePicker =
+        rememberLauncherForActivityResult(
+            contract =
+                ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri != null) {
+                try {
+                    val importedText =
+                        context.contentResolver
+                            .openInputStream(uri)
+                            ?.bufferedReader()
+                            ?.use { reader ->
+                                reader.readText()
+                            }
+                            .orEmpty()
 
-    var voiceMenuOpen by remember {
-        mutableStateOf(false)
-    }
+                    if (importedText.isBlank()) {
+                        Toast.makeText(
+                            context,
+                            "The selected file is empty.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        text = importedText
+                        onTextChanged(importedText)
 
-    val selectedVoice =
-        voices.firstOrNull {
-            it.name == selectedVoiceName
+                        Toast.makeText(
+                            context,
+                            "Text file imported.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                } catch (error: Throwable) {
+                    Toast.makeText(
+                        context,
+                        "Could not open file: " +
+                                error.message,
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
         }
+
+    LaunchedEffect(playbackStatus) {
+        playerState =
+            when (playbackStatus) {
+                "Reading" -> 1
+                "Preparing voice…" -> 1
+                "Preparing next section…" -> 1
+                "Paused" -> 2
+                else -> 0
+            }
+    }
 
     Column(
         modifier = Modifier
@@ -433,7 +248,6 @@ fun AIReaderScreen(
         verticalArrangement =
             Arrangement.spacedBy(12.dp)
     ) {
-
         Text(
             text = "AI Reader",
             style =
@@ -441,69 +255,72 @@ fun AIReaderScreen(
         )
 
         Text(
-            text = "Enter or paste text below"
+            text = "Free offline AI voice"
         )
+
+        Text(
+            text =
+                "English (United States) • Lessac"
+        )
+
+        Surface(
+            color =
+                MaterialTheme.colorScheme
+                    .secondaryContainer,
+            shape =
+                MaterialTheme.shapes.medium,
+            modifier =
+                Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Status: $playbackStatus",
+                modifier =
+                    Modifier.padding(12.dp),
+                style =
+                    MaterialTheme.typography
+                        .bodyMedium
+            )
+        }
 
         OutlinedTextField(
             value = text,
-            onValueChange = {
-                text = it
+            onValueChange = { newText ->
+                text = newText
+                onTextChanged(newText)
             },
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
             label = {
                 Text("Text to read")
+            },
+            placeholder = {
+                Text(
+                    "Enter, paste, or import text"
+                )
             }
-        )
-
-        OutlinedButton(
-        onClick = onTestAiVoice,
-        modifier = Modifier.fillMaxWidth()
-)       {
-    Text("Test Offline AI Voice")
-}
-
-        Text(
-            text = "Voice"
         )
 
         OutlinedButton(
             onClick = {
-                voiceMenuOpen = true
+                filePicker.launch(
+                    arrayOf("text/plain")
+                )
             },
-            modifier = Modifier.fillMaxWidth()
+            enabled = playerState == 0,
+            modifier =
+                Modifier.fillMaxWidth()
         ) {
-
-            Text(
-                text =
-                    selectedVoice?.let {
-                        voiceDisplayName(it)
-                    } ?: "Select voice"
-            )
+            Text("📄 Import Text File")
         }
 
-        DropdownMenu(
-            expanded = voiceMenuOpen,
-            onDismissRequest = {
-                voiceMenuOpen = false
-            }
+        OutlinedButton(
+            onClick = onTestAiVoice,
+            enabled = playerState == 0,
+            modifier =
+                Modifier.fillMaxWidth()
         ) {
-
-            voices.forEach { voice ->
-
-                DropdownMenuItem(
-                    text = {
-                        Text(
-                            text = voiceDisplayName(voice)
-                        )
-                    },
-                    onClick = {
-                        onVoiceSelected(voice)
-                        voiceMenuOpen = false
-                    }
-                )
-            }
+            Text("Test Offline AI Voice")
         }
 
         Text(
@@ -516,102 +333,65 @@ fun AIReaderScreen(
                 speed = it
                 onSpeedChanged(it)
             },
+            enabled = playerState == 0,
             valueRange = 0.5f..2.0f,
             steps = 14
         )
 
-        Text(
-            text = "Pitch: %.1f".format(pitch)
-        )
-
-        Slider(
-            value = pitch,
-            onValueChange = {
-                pitch = it
-                onPitchChanged(it)
-            },
-            valueRange = 0.5f..1.5f,
-            steps = 9
-        )
-
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier =
+                Modifier.fillMaxWidth(),
             horizontalArrangement =
                 Arrangement.spacedBy(8.dp)
         ) {
-
             Button(
                 onClick = {
-                    onPlay(text)
-                    playerState = 1
+                    if (text.isNotBlank()) {
+                        onPlay(text)
+                    }
                 },
-                modifier = Modifier.weight(1f)
+                enabled =
+                    text.isNotBlank() &&
+                            playerState == 0,
+                modifier =
+                    Modifier.weight(1f)
             ) {
                 Text("▶ Play")
             }
 
             Button(
-                onClick = {
-                    onPause()
-                    playerState = 2
-                },
+                onClick = onPause,
                 enabled = playerState == 1,
-                modifier = Modifier.weight(1f)
+                modifier =
+                    Modifier.weight(1f)
             ) {
                 Text("⏸ Pause")
             }
         }
 
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier =
+                Modifier.fillMaxWidth(),
             horizontalArrangement =
                 Arrangement.spacedBy(8.dp)
         ) {
-
             Button(
-                onClick = {
-                    onResume()
-                    playerState = 1
-                },
+                onClick = onResume,
                 enabled = playerState == 2,
-                modifier = Modifier.weight(1f)
+                modifier =
+                    Modifier.weight(1f)
             ) {
                 Text("▶ Resume")
             }
 
             Button(
-                onClick = {
-                    onStop()
-                    playerState = 0
-                },
+                onClick = onStop,
                 enabled = playerState != 0,
-                modifier = Modifier.weight(1f)
+                modifier =
+                    Modifier.weight(1f)
             ) {
                 Text("■ Stop")
             }
         }
     }
-}
-
-fun voiceDisplayName(voice: Voice): String {
-
-    val locale = voice.locale
-
-    val location =
-        when {
-            locale.displayCountry.isNotBlank() ->
-                "${locale.displayLanguage} (${locale.displayCountry})"
-
-            else ->
-                locale.displayLanguage
-        }
-
-    val connection =
-        if (voice.isNetworkConnectionRequired) {
-            "Online"
-        } else {
-            "Offline"
-        }
-
-    return "$location • $connection • ${voice.name}"
 }
