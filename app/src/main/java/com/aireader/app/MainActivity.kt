@@ -1,5 +1,8 @@
 package com.aireader.app
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.height
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -23,6 +26,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -34,6 +38,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -230,6 +235,17 @@ fun AIReaderScreen(
 ) {
     val context = LocalContext.current
 
+    val photoTextRecognizer =
+        remember {
+            PhotoTextRecognizer(context)
+        }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            photoTextRecognizer.close()
+        }
+    }
+
     var textFieldValue by remember {
         mutableStateOf(
             TextFieldValue(
@@ -258,6 +274,14 @@ fun AIReaderScreen(
         mutableStateOf(
             "AI-Reader-Audio.wav"
         )
+    }
+
+    var cameraImageUri by remember {
+        mutableStateOf<Uri?>(null)
+    }
+
+    var scanningPhoto by remember {
+        mutableStateOf(false)
     }
 
     val hasSelection =
@@ -337,6 +361,79 @@ fun AIReaderScreen(
             }
         }
 
+    val cameraLauncher =
+        rememberLauncherForActivityResult(
+            contract =
+                ActivityResultContracts.TakePicture()
+        ) { pictureSaved ->
+            val imageUri = cameraImageUri
+
+            if (
+                pictureSaved &&
+                imageUri != null
+            ) {
+                scanningPhoto = true
+
+                photoTextRecognizer.recognize(
+                    imageUri = imageUri,
+
+                    onSuccess = { recognizedText ->
+                        scanningPhoto = false
+
+                        if (recognizedText.isBlank()) {
+                            Toast.makeText(
+                                context,
+                                "No text was found in the photo.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } else {
+                            val combinedText =
+                                if (
+                                    textFieldValue.text
+                                        .isBlank()
+                                ) {
+                                    recognizedText
+                                } else {
+                                    textFieldValue.text +
+                                            "\n\n" +
+                                            recognizedText
+                                }
+
+                            textFieldValue =
+                                TextFieldValue(
+                                    text = combinedText,
+                                    selection =
+                                        TextRange(
+                                            combinedText.length
+                                        )
+                                )
+
+                            onTextChanged(combinedText)
+
+                            Toast.makeText(
+                                context,
+                                "Photo text added.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    },
+
+                    onError = { error ->
+                        scanningPhoto = false
+
+                        Toast.makeText(
+                            context,
+                            "Could not read photo: " +
+                                    error.message,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                )
+            } else {
+                scanningPhoto = false
+            }
+        }
+
     LaunchedEffect(playbackStatus) {
         playerState =
             when {
@@ -361,13 +458,19 @@ fun AIReaderScreen(
             }
     }
 
+    val screenBusy =
+        playerState != 0 ||
+                scanningPhoto
+
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement =
             Arrangement.spacedBy(10.dp)
-    ) {
+    )
+    {
         Text(
             text = "AI Reader",
             style =
@@ -383,7 +486,7 @@ fun AIReaderScreen(
             onClick = {
                 voiceMenuOpen = true
             },
-            enabled = playerState == 0,
+            enabled = !screenBusy,
             modifier =
                 Modifier.fillMaxWidth()
         ) {
@@ -425,7 +528,11 @@ fun AIReaderScreen(
         ) {
             Text(
                 text =
-                    "Status: $playbackStatus",
+                    if (scanningPhoto) {
+                        "Status: Reading photo…"
+                    } else {
+                        "Status: $playbackStatus"
+                    },
                 modifier =
                     Modifier.padding(12.dp)
             )
@@ -439,13 +546,13 @@ fun AIReaderScreen(
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .height(160.dp),
             label = {
                 Text("Text to read")
             },
             placeholder = {
                 Text(
-                    "Enter, paste, or import text"
+                    "Enter, paste, import, or scan text"
                 )
             }
         )
@@ -462,7 +569,7 @@ fun AIReaderScreen(
                         arrayOf("text/plain")
                     )
                 },
-                enabled = playerState == 0,
+                enabled = !screenBusy,
                 modifier =
                     Modifier.weight(1f)
             ) {
@@ -471,25 +578,68 @@ fun AIReaderScreen(
 
             OutlinedButton(
                 onClick = {
-                    textFieldValue =
-                        textFieldValue.copy(
-                            selection =
-                                TextRange(
-                                    start = 0,
-                                    end =
-                                        textFieldValue
-                                            .text.length
-                                )
-                        )
+                    try {
+                        val cameraFolder =
+                            File(
+                                context.cacheDir,
+                                "camera"
+                            )
+
+                        cameraFolder.mkdirs()
+
+                        val photoFile =
+                            File.createTempFile(
+                                "text-photo-",
+                                ".jpg",
+                                cameraFolder
+                            )
+
+                        val photoUri =
+                            FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.fileprovider",
+                                photoFile
+                            )
+
+                        cameraImageUri = photoUri
+                        cameraLauncher.launch(photoUri)
+                    } catch (error: Throwable) {
+                        Toast.makeText(
+                            context,
+                            "Could not open camera: " +
+                                    error.message,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 },
-                enabled =
-                    textFieldValue.text.isNotEmpty() &&
-                            playerState == 0,
+                enabled = !screenBusy,
                 modifier =
                     Modifier.weight(1f)
             ) {
-                Text("Select All")
+                Text("📷 Scan Text")
             }
+        }
+
+        OutlinedButton(
+            onClick = {
+                textFieldValue =
+                    textFieldValue.copy(
+                        selection =
+                            TextRange(
+                                start = 0,
+                                end =
+                                    textFieldValue
+                                        .text.length
+                            )
+                    )
+            },
+            enabled =
+                textFieldValue.text.isNotEmpty() &&
+                        !screenBusy,
+            modifier =
+                Modifier.fillMaxWidth()
+        ) {
+            Text("Select All")
         }
 
         Row(
@@ -514,7 +664,7 @@ fun AIReaderScreen(
                 },
                 enabled =
                     textFieldValue.text.isNotBlank() &&
-                            playerState == 0,
+                            !screenBusy,
                 modifier =
                     Modifier.weight(1f)
             ) {
@@ -537,7 +687,7 @@ fun AIReaderScreen(
                 },
                 enabled =
                     selectedText.isNotBlank() &&
-                            playerState == 0,
+                            !screenBusy,
                 modifier =
                     Modifier.weight(1f)
             ) {
@@ -558,7 +708,7 @@ fun AIReaderScreen(
 
         OutlinedButton(
             onClick = onTestAiVoice,
-            enabled = playerState == 0,
+            enabled = !screenBusy,
             modifier =
                 Modifier.fillMaxWidth()
         ) {
@@ -576,7 +726,7 @@ fun AIReaderScreen(
                 speed = it
                 onSpeedChanged(it)
             },
-            enabled = playerState == 0,
+            enabled = !screenBusy,
             valueRange = 0.5f..2.0f,
             steps = 14
         )
@@ -600,7 +750,7 @@ fun AIReaderScreen(
                 },
                 enabled =
                     textFieldValue.text.isNotBlank() &&
-                            playerState == 0,
+                            !screenBusy,
                 modifier =
                     Modifier.weight(1f)
             ) {
