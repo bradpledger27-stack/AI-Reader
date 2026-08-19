@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
@@ -11,7 +12,10 @@ import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
 
 class AiVoicePlayer(
     private val context: Context,
@@ -25,6 +29,11 @@ class AiVoicePlayer(
     private var currentSpeed = 1.0f
     private var paused = false
 
+    private val ttsLock = Any()
+    @Volatile
+    private var selectedVoice =
+        AiVoiceOption.LESSAC
+
     @Volatile
     private var generationNumber = 0
 
@@ -34,6 +43,31 @@ class AiVoicePlayer(
         Handler(Looper.getMainLooper()).post {
             onStatusChanged(status)
         }
+    }
+
+    fun selectVoice(
+        voice: AiVoiceOption
+    ) {
+        if (voice == selectedVoice) {
+            return
+        }
+
+        generationNumber++
+        stopAudio()
+
+        synchronized(ttsLock) {
+            offlineTts?.release()
+            offlineTts = null
+            selectedVoice = voice
+        }
+
+        chunks = emptyList()
+        currentChunk = 0
+        paused = false
+
+        updateStatus(
+            "Voice selected: ${voice.displayName}"
+        )
     }
 
     fun speakTestSentence() {
@@ -79,16 +113,20 @@ class AiVoicePlayer(
 
         Thread {
             try {
-                val tts =
-                    offlineTts ?: createTts().also {
-                        offlineTts = it
-                    }
+                val audio =
+                    synchronized(ttsLock) {
+                        val tts =
+                            offlineTts
+                                ?: createTts().also {
+                                    offlineTts = it
+                                }
 
-                val audio = tts.generate(
-                    text = text,
-                    sid = 0,
-                    speed = currentSpeed
-                )
+                        tts.generate(
+                            text = text,
+                            sid = 0,
+                            speed = currentSpeed
+                        )
+                    }
 
                 if (
                     expectedGeneration != generationNumber
@@ -212,6 +250,242 @@ class AiVoicePlayer(
                 showError(error)
             }
         }.start()
+    }
+
+    fun saveAsWav(
+        text: String,
+        speed: Float,
+        destination: Uri
+    ) {
+        if (text.isBlank()) {
+            return
+        }
+
+        generationNumber++
+        stopAudio()
+        paused = false
+
+        val exportGeneration =
+            generationNumber
+
+        updateStatus("Generating audio…")
+
+        Thread {
+            val temporaryPcmFile =
+                File(
+                    context.cacheDir,
+                    "ai-reader-${System.nanoTime()}.pcm"
+                )
+
+            try {
+                val exportChunks =
+                    splitText(text)
+
+                var sampleRate = 0
+                var completedChunks = 0
+
+                BufferedOutputStream(
+                    FileOutputStream(
+                        temporaryPcmFile
+                    )
+                ).use { pcmOutput ->
+
+                    exportChunks.forEach { chunk ->
+                        if (
+                            exportGeneration !=
+                            generationNumber
+                        ) {
+                            return@Thread
+                        }
+
+                        val audio =
+                            synchronized(ttsLock) {
+                                val tts =
+                                    offlineTts
+                                        ?: createTts().also {
+                                            offlineTts = it
+                                        }
+
+                                tts.generate(
+                                    text = chunk,
+                                    sid = 0,
+                                    speed = speed
+                                )
+                            }
+
+                        if (sampleRate == 0) {
+                            sampleRate =
+                                audio.sampleRate
+                        }
+
+                        writePcm16Samples(
+                            output = pcmOutput,
+                            samples = audio.samples
+                        )
+
+                        completedChunks++
+
+                        updateStatus(
+                            "Generating audio " +
+                                    "$completedChunks/" +
+                                    "${exportChunks.size}…"
+                        )
+                    }
+                }
+
+                if (
+                    exportGeneration != generationNumber
+                ) {
+                    return@Thread
+                }
+
+                val outputStream =
+                    context.contentResolver
+                        .openOutputStream(
+                            destination,
+                            "w"
+                        )
+                        ?: throw IllegalStateException(
+                            "Could not create the audio file."
+                        )
+
+                outputStream.use { output ->
+                    writeWavHeader(
+                        output = output,
+                        sampleRate = sampleRate,
+                        dataSize =
+                            temporaryPcmFile.length()
+                    )
+
+                    temporaryPcmFile
+                        .inputStream()
+                        .use { input ->
+                            input.copyTo(output)
+                        }
+
+                    output.flush()
+                }
+
+                updateStatus("Audio saved")
+            } catch (error: Throwable) {
+                showError(error)
+            } finally {
+                temporaryPcmFile.delete()
+            }
+        }.start()
+    }
+
+    private fun writePcm16Samples(
+        output: OutputStream,
+        samples: FloatArray
+    ) {
+        val buffer =
+            ByteArray(samples.size * 2)
+
+        var bufferPosition = 0
+
+        samples.forEach { sample ->
+            val pcmValue =
+                (
+                        sample.coerceIn(
+                            -1.0f,
+                            1.0f
+                        ) * 32767.0f
+                        ).toInt()
+
+            buffer[bufferPosition] =
+                (pcmValue and 0xff).toByte()
+
+            buffer[bufferPosition + 1] =
+                (
+                        pcmValue shr 8 and 0xff
+                        ).toByte()
+
+            bufferPosition += 2
+        }
+
+        output.write(buffer)
+    }
+
+    private fun writeWavHeader(
+        output: OutputStream,
+        sampleRate: Int,
+        dataSize: Long
+    ) {
+        output.write(
+            "RIFF".toByteArray(Charsets.US_ASCII)
+        )
+
+        writeIntLittleEndian(
+            output,
+            36L + dataSize
+        )
+
+        output.write(
+            "WAVE".toByteArray(Charsets.US_ASCII)
+        )
+
+        output.write(
+            "fmt ".toByteArray(Charsets.US_ASCII)
+        )
+
+        writeIntLittleEndian(output, 16)
+        writeShortLittleEndian(output, 1)
+        writeShortLittleEndian(output, 1)
+
+        writeIntLittleEndian(
+            output,
+            sampleRate.toLong()
+        )
+
+        writeIntLittleEndian(
+            output,
+            sampleRate.toLong() * 2L
+        )
+
+        writeShortLittleEndian(output, 2)
+        writeShortLittleEndian(output, 16)
+
+        output.write(
+            "data".toByteArray(Charsets.US_ASCII)
+        )
+
+        writeIntLittleEndian(
+            output,
+            dataSize
+        )
+    }
+
+    private fun writeIntLittleEndian(
+        output: OutputStream,
+        value: Long
+    ) {
+        output.write(
+            (value and 0xff).toInt()
+        )
+
+        output.write(
+            (value shr 8 and 0xff).toInt()
+        )
+
+        output.write(
+            (value shr 16 and 0xff).toInt()
+        )
+
+        output.write(
+            (value shr 24 and 0xff).toInt()
+        )
+    }
+
+    private fun writeShortLittleEndian(
+        output: OutputStream,
+        value: Int
+    ) {
+        output.write(value and 0xff)
+
+        output.write(
+            value shr 8 and 0xff
+        )
     }
 
     fun pause() {
@@ -412,17 +686,14 @@ class AiVoicePlayer(
                 .orEmpty()
 
         if (entries.isEmpty()) {
-            destination.parentFile
-                ?.mkdirs()
+            destination.parentFile?.mkdirs()
 
             context.assets
                 .open(assetPath)
                 .use { input ->
-
                     destination
                         .outputStream()
                         .use { output ->
-
                             input.copyTo(output)
                         }
                 }
@@ -450,12 +721,11 @@ class AiVoicePlayer(
         val vitsConfig =
             OfflineTtsVitsModelConfig(
                 model =
-                    "tts/en_US-lessac-medium.onnx",
+                    selectedVoice.modelPath,
                 tokens =
                     "tts/tokens.txt",
                 dataDir =
-                    espeakDataDirectory
-                        .absolutePath
+                    espeakDataDirectory.absolutePath
             )
 
         val modelConfig =
@@ -467,12 +737,10 @@ class AiVoicePlayer(
             )
 
         return OfflineTts(
-            assetManager =
-                context.assets,
-            config =
-                OfflineTtsConfig(
-                    model = modelConfig
-                )
+            assetManager = context.assets,
+            config = OfflineTtsConfig(
+                model = modelConfig
+            )
         )
     }
 
@@ -480,7 +748,9 @@ class AiVoicePlayer(
         generationNumber++
         stopAudio()
 
-        offlineTts?.release()
-        offlineTts = null
+        synchronized(ttsLock) {
+            offlineTts?.release()
+            offlineTts = null
+        }
     }
 }

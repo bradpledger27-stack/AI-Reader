@@ -1,5 +1,6 @@
 package com.aireader.app
 
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -13,6 +14,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -28,6 +31,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import java.io.File
 
@@ -37,6 +42,9 @@ class MainActivity : ComponentActivity() {
 
     private var speechRate = 1.0f
     private var currentReaderText = ""
+
+    private var selectedVoice by
+    mutableStateOf(AiVoiceOption.LESSAC)
 
     private var playbackStatus by
     mutableStateOf("Ready")
@@ -49,7 +57,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private val savedTextFile by lazy {
-        File(filesDir, "saved_reader_text.txt")
+        File(
+            filesDir,
+            "saved_reader_text.txt"
+        )
     }
 
     override fun onCreate(
@@ -62,6 +73,18 @@ class MainActivity : ComponentActivity() {
                 "speech_rate",
                 1.0f
             )
+
+        selectedVoice =
+            try {
+                AiVoiceOption.valueOf(
+                    prefs.getString(
+                        "selected_ai_voice",
+                        AiVoiceOption.LESSAC.name
+                    ) ?: AiVoiceOption.LESSAC.name
+                )
+            } catch (_: Throwable) {
+                AiVoiceOption.LESSAC
+            }
 
         currentReaderText =
             try {
@@ -82,6 +105,10 @@ class MainActivity : ComponentActivity() {
                 }
             )
 
+        aiVoicePlayer.selectVoice(
+            selectedVoice
+        )
+
         setContent {
             MaterialTheme {
                 Surface(
@@ -92,6 +119,8 @@ class MainActivity : ComponentActivity() {
                             currentReaderText,
                         initialSpeed =
                             speechRate,
+                        selectedVoice =
+                            selectedVoice,
                         playbackStatus =
                             playbackStatus,
 
@@ -99,10 +128,33 @@ class MainActivity : ComponentActivity() {
                             currentReaderText = text
                         },
 
+                        onVoiceSelected = { voice ->
+                            selectedVoice = voice
+
+                            aiVoicePlayer.selectVoice(
+                                voice
+                            )
+
+                            prefs.edit()
+                                .putString(
+                                    "selected_ai_voice",
+                                    voice.name
+                                )
+                                .apply()
+                        },
+
                         onPlay = { text ->
                             aiVoicePlayer.speak(
                                 text = text,
                                 speed = speechRate
+                            )
+                        },
+
+                        onSaveAudio = { text, uri ->
+                            aiVoicePlayer.saveAsWav(
+                                text = text,
+                                speed = speechRate,
+                                destination = uri
                             )
                         },
 
@@ -145,7 +197,7 @@ class MainActivity : ComponentActivity() {
                 currentReaderText
             )
         } catch (_: Throwable) {
-            // Keep the app running if saving fails.
+            // Keep running if saving fails.
         }
 
         super.onStop()
@@ -164,9 +216,12 @@ class MainActivity : ComponentActivity() {
 fun AIReaderScreen(
     initialText: String,
     initialSpeed: Float,
+    selectedVoice: AiVoiceOption,
     playbackStatus: String,
     onTextChanged: (String) -> Unit,
+    onVoiceSelected: (AiVoiceOption) -> Unit,
     onPlay: (String) -> Unit,
+    onSaveAudio: (String, Uri) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onStop: () -> Unit,
@@ -175,8 +230,12 @@ fun AIReaderScreen(
 ) {
     val context = LocalContext.current
 
-    var text by remember {
-        mutableStateOf(initialText)
+    var textFieldValue by remember {
+        mutableStateOf(
+            TextFieldValue(
+                text = initialText
+            )
+        )
     }
 
     var playerState by remember {
@@ -187,7 +246,34 @@ fun AIReaderScreen(
         mutableStateOf(initialSpeed)
     }
 
-    val filePicker =
+    var voiceMenuOpen by remember {
+        mutableStateOf(false)
+    }
+
+    var audioTextToSave by remember {
+        mutableStateOf("")
+    }
+
+    var suggestedAudioName by remember {
+        mutableStateOf(
+            "AI-Reader-Audio.wav"
+        )
+    }
+
+    val hasSelection =
+        !textFieldValue.selection.collapsed
+
+    val selectedText =
+        if (hasSelection) {
+            textFieldValue.text.substring(
+                textFieldValue.selection.min,
+                textFieldValue.selection.max
+            )
+        } else {
+            ""
+        }
+
+    val textFilePicker =
         rememberLauncherForActivityResult(
             contract =
                 ActivityResultContracts.OpenDocument()
@@ -210,7 +296,11 @@ fun AIReaderScreen(
                             Toast.LENGTH_LONG
                         ).show()
                     } else {
-                        text = importedText
+                        textFieldValue =
+                            TextFieldValue(
+                                text = importedText
+                            )
+
                         onTextChanged(importedText)
 
                         Toast.makeText(
@@ -230,14 +320,44 @@ fun AIReaderScreen(
             }
         }
 
+    val audioFilePicker =
+        rememberLauncherForActivityResult(
+            contract =
+                ActivityResultContracts
+                    .CreateDocument("audio/wav")
+        ) { uri ->
+            if (
+                uri != null &&
+                audioTextToSave.isNotBlank()
+            ) {
+                onSaveAudio(
+                    audioTextToSave,
+                    uri
+                )
+            }
+        }
+
     LaunchedEffect(playbackStatus) {
         playerState =
-            when (playbackStatus) {
-                "Reading" -> 1
-                "Preparing voice…" -> 1
-                "Preparing next section…" -> 1
-                "Paused" -> 2
-                else -> 0
+            when {
+                playbackStatus == "Paused" ->
+                    2
+
+                playbackStatus.startsWith(
+                    "Generating audio"
+                ) ->
+                    3
+
+                playbackStatus == "Reading" ->
+                    1
+
+                playbackStatus.startsWith(
+                    "Preparing"
+                ) ->
+                    1
+
+                else ->
+                    0
             }
     }
 
@@ -246,22 +366,53 @@ fun AIReaderScreen(
             .fillMaxSize()
             .padding(24.dp),
         verticalArrangement =
-            Arrangement.spacedBy(12.dp)
+            Arrangement.spacedBy(10.dp)
     ) {
         Text(
             text = "AI Reader",
             style =
-                MaterialTheme.typography.headlineLarge
+                MaterialTheme.typography
+                    .headlineLarge
         )
 
         Text(
-            text = "Free offline AI voice"
+            text = "Offline AI voice"
         )
 
-        Text(
-            text =
-                "English (United States) • Lessac"
-        )
+        OutlinedButton(
+            onClick = {
+                voiceMenuOpen = true
+            },
+            enabled = playerState == 0,
+            modifier =
+                Modifier.fillMaxWidth()
+        ) {
+            Text(
+                selectedVoice.displayName
+            )
+        }
+
+        DropdownMenu(
+            expanded = voiceMenuOpen,
+            onDismissRequest = {
+                voiceMenuOpen = false
+            }
+        ) {
+            AiVoiceOption.values()
+                .forEach { voice ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                voice.displayName
+                            )
+                        },
+                        onClick = {
+                            onVoiceSelected(voice)
+                            voiceMenuOpen = false
+                        }
+                    )
+                }
+        }
 
         Surface(
             color =
@@ -273,20 +424,18 @@ fun AIReaderScreen(
                 Modifier.fillMaxWidth()
         ) {
             Text(
-                text = "Status: $playbackStatus",
+                text =
+                    "Status: $playbackStatus",
                 modifier =
-                    Modifier.padding(12.dp),
-                style =
-                    MaterialTheme.typography
-                        .bodyMedium
+                    Modifier.padding(12.dp)
             )
         }
 
         OutlinedTextField(
-            value = text,
-            onValueChange = { newText ->
-                text = newText
-                onTextChanged(newText)
+            value = textFieldValue,
+            onValueChange = { newValue ->
+                textFieldValue = newValue
+                onTextChanged(newValue.text)
             },
             modifier = Modifier
                 .fillMaxWidth()
@@ -301,18 +450,111 @@ fun AIReaderScreen(
             }
         )
 
-        OutlinedButton(
-            onClick = {
-                filePicker.launch(
-                    arrayOf("text/plain")
-                )
-            },
-            enabled = playerState == 0,
+        Row(
             modifier =
-                Modifier.fillMaxWidth()
+                Modifier.fillMaxWidth(),
+            horizontalArrangement =
+                Arrangement.spacedBy(8.dp)
         ) {
-            Text("📄 Import Text File")
+            OutlinedButton(
+                onClick = {
+                    textFilePicker.launch(
+                        arrayOf("text/plain")
+                    )
+                },
+                enabled = playerState == 0,
+                modifier =
+                    Modifier.weight(1f)
+            ) {
+                Text("📄 Import")
+            }
+
+            OutlinedButton(
+                onClick = {
+                    textFieldValue =
+                        textFieldValue.copy(
+                            selection =
+                                TextRange(
+                                    start = 0,
+                                    end =
+                                        textFieldValue
+                                            .text.length
+                                )
+                        )
+                },
+                enabled =
+                    textFieldValue.text.isNotEmpty() &&
+                            playerState == 0,
+                modifier =
+                    Modifier.weight(1f)
+            ) {
+                Text("Select All")
+            }
         }
+
+        Row(
+            modifier =
+                Modifier.fillMaxWidth(),
+            horizontalArrangement =
+                Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = {
+                    audioTextToSave =
+                        textFieldValue.text
+
+                    suggestedAudioName =
+                        "AI-Reader-" +
+                                selectedVoice.name +
+                                ".wav"
+
+                    audioFilePicker.launch(
+                        suggestedAudioName
+                    )
+                },
+                enabled =
+                    textFieldValue.text.isNotBlank() &&
+                            playerState == 0,
+                modifier =
+                    Modifier.weight(1f)
+            ) {
+                Text("💾 Save All")
+            }
+
+            OutlinedButton(
+                onClick = {
+                    audioTextToSave =
+                        selectedText
+
+                    suggestedAudioName =
+                        "AI-Reader-Selection-" +
+                                selectedVoice.name +
+                                ".wav"
+
+                    audioFilePicker.launch(
+                        suggestedAudioName
+                    )
+                },
+                enabled =
+                    selectedText.isNotBlank() &&
+                            playerState == 0,
+                modifier =
+                    Modifier.weight(1f)
+            ) {
+                Text("💾 Save Selected")
+            }
+        }
+
+        Text(
+            text =
+                if (hasSelection) {
+                    "${selectedText.length} characters selected"
+                } else {
+                    "Long-press and drag to select text"
+                },
+            style =
+                MaterialTheme.typography.bodySmall
+        )
 
         OutlinedButton(
             onClick = onTestAiVoice,
@@ -320,11 +562,12 @@ fun AIReaderScreen(
             modifier =
                 Modifier.fillMaxWidth()
         ) {
-            Text("Test Offline AI Voice")
+            Text("Test Selected Voice")
         }
 
         Text(
-            text = "Speed: %.1fx".format(speed)
+            text =
+                "Speed: %.1fx".format(speed)
         )
 
         Slider(
@@ -346,12 +589,17 @@ fun AIReaderScreen(
         ) {
             Button(
                 onClick = {
-                    if (text.isNotBlank()) {
-                        onPlay(text)
+                    if (
+                        textFieldValue.text
+                            .isNotBlank()
+                    ) {
+                        onPlay(
+                            textFieldValue.text
+                        )
                     }
                 },
                 enabled =
-                    text.isNotBlank() &&
+                    textFieldValue.text.isNotBlank() &&
                             playerState == 0,
                 modifier =
                     Modifier.weight(1f)
